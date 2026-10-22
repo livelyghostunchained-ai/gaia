@@ -14,17 +14,6 @@ with open("src/gaia/version.py", encoding="utf-8") as fp:
 
 tkml_version = "5.0.4"
 
-# Standalone AMD agent wheels ('gaia-agent-<id>'), read statically by
-# util/list_agent_packages.py for build_agent_package.yml and
-# util/publish_agents_to_hub.py. Deliberately NOT an extras_require entry: the
-# wheels are not on PyPI, and an 'amd-gaia[agents]' extra naming them made pip
-# silently downgrade amd-gaia to the newest release without the extra (#2240).
-AGENT_WHEEL_PACKAGES = [
-    "gaia-agent-email",
-    "gaia-agent-chat",
-    "gaia-agent-gaia",
-]
-
 setup(
     name="amd-gaia",
     version=gaia_version,
@@ -39,29 +28,19 @@ setup(
         "gaia.llm.providers",
         "gaia.audio",
         "gaia.chat",
-        "gaia.schedule",
-        "gaia.daemon",
-        "gaia.daemon.custody",
-        "gaia.daemon.scheduler",
-        "gaia.daemon.sidecars",
-        "gaia.ui",
-        "gaia.ui.routers",
-        "gaia.ui.email_sidecar",
-        "gaia.sidecar",
         "gaia.database",
         "gaia.talk",
         "gaia.testing",
         "gaia.utils",
         "gaia.apps",
+        "gaia.apps.docker",
+        "gaia.apps.jira",
         "gaia.apps.llm",
+        "gaia.apps.summarize",
+        "gaia.apps.summarize.templates",
         "gaia.eval",
-        "gaia.engineering",
-        "gaia.eval.bench",
-        "gaia.eval.retrieval",
-        "gaia.eval.memory",
-        "gaia.eval.code_retrieval",
+        "gaia.eval.fix_code_testbench",
         "gaia.installer",
-        "gaia.hub",
         "gaia.rag",
         "gaia.mcp",
         "gaia.mcp.client",
@@ -70,31 +49,30 @@ setup(
         "gaia.agents",
         "gaia.agents.base",
         "gaia.agents.tools",
-        "gaia.agents.tools._email",
-        "gaia.agents.code_index",
-        "gaia.agents.code_index.tools",
-        "gaia.governance",
-        "gaia.factory",
-        "gaia.factory.harvest",
+        "gaia.agents.blender",
+        "gaia.agents.blender.core",
+        "gaia.agents.chat",
+        "gaia.agents.chat.tools",
+        "gaia.agents.docker",
+        "gaia.agents.emr",
+        "gaia.agents.emr.dashboard",
+        "gaia.agents.jira",
+        "gaia.agents.code",
+        "gaia.agents.code.orchestration",
+        "gaia.agents.code.orchestration.factories",
+        "gaia.agents.code.orchestration.steps",
+        "gaia.agents.code.orchestration.workflows",
+        "gaia.agents.code.prompts",
+        "gaia.agents.code.tools",
+        "gaia.agents.code.validators",
+        "gaia.agents.routing",
+        "gaia.agents.sd",
+        "gaia.agents.summarize",
         "gaia.sd",
         "gaia.vlm",
         "gaia.api",
-        "gaia.filesystem",
-        "gaia.scratchpad",
-        "gaia.web",
-        "gaia.browser",
-        "gaia.code_index",
-        "gaia.apps.webui",
-        "gaia.messaging",
-        "gaia.messaging.slack",
-        "gaia.connectors",
-        "gaia.connectors.catalog",
-        "gaia.connectors.providers",
-        "gaia.skills",
-        "gaia.skills.audit",
     ],
     package_data={
-        "gaia.eval.memory": ["scenarios/*.yaml"],
         "gaia.eval": [
             "webapp/*.json",
             "webapp/*.js",
@@ -103,163 +81,47 @@ setup(
             "webapp/public/*.css",
             "webapp/public/*.js",
         ],
-        # Browser-mode Agent UI bundle. Recursive globs in package_data are
-        # unreliable across setuptools versions, so we list shallow patterns
-        # here and back them up with `recursive-include` in MANIFEST.in. The
-        # CI verifier (util/verify_wheel_dist.py) enforces that the wheel
-        # actually contains these entries before publish.
-        "gaia.apps.webui": [
-            "dist/index.html",
-            "dist/*.svg",
-            "dist/*.png",
-            "dist/*.ico",
-            "dist/*.webmanifest",
-            "dist/*.json",
-            "dist/*.txt",
-            "dist/assets/*",
-        ],
     },
     install_requires=[
-        # Staged by #382 for the Lemonade Realtime transcription work in #372.
-        # OpenAI 1.58.0 is the first release with Realtime API support.
-        "openai>=1.58.0",
+        "openai",
         "pydantic>=2.9.2",
-        # Core imports these directly; never rely on a heavier dep pulling them in.
-        "pyyaml>=6.0.1",
-        "numpy>=1.24.0",
-        "psutil>=5.9.0",
-        "python-dateutil>=2.8.2",
+        "transformers",
+        "accelerate",
         "python-dotenv",
         "aiohttp",
         "rich",
-        # 2.32.3 added HTTPAdapter.build_connection_pool_key_attributes, which
-        # PinnedIPAdapter overrides to set the TLS SNI while pinning the IP.
-        # 2.32.2 is specifically unusable: it routes through
-        # get_connection_with_tls_context but has no such hook, so the SNI
-        # would silently revert to the pinned IP.
-        "requests>=2.32.3",
-        # <1.0: openai checks any imported httpx for httpx.Timeout, which the
-        # 1.0 pre-releases removed, so `pip install --pre` broke every chat turn.
-        "httpx>=0.27.0,<1.0",
-        # HTTPS trusts the OS certificate store (gaia.tls), so a corporate
-        # TLS-inspecting proxy's root works as it does for pip. 0.10 also
-        # honours CA files loaded on top (certifi), so nothing stops verifying.
-        "truststore>=0.10.0",
-        "beautifulsoup4",
+        "requests",
         "watchdog>=2.1.0",
         "pillow>=9.0.0",
-        # Cron-based scheduler (issue #892): apscheduler drives the daemon;
-        # tomli/tomli-w read+write ~/.gaia/schedules.toml (tomllib is stdlib on 3.11+).
-        # <4: APScheduler 4 drops apscheduler.schedulers/.events, which gaia.schedule imports.
-        "apscheduler>=3.10.0,<4.0",
-        # Agent UI schedules run "daily at 9am" in the PC's own time zone;
-        # tzlocal names it (IANA) and pulls in tzdata on Windows for zoneinfo.
-        "tzlocal>=4.0",
-        "tomli-w>=1.0.0",
-        "tomli>=2.0.0; python_version < '3.11'",
-        # gaia connectors is a base CLI command; keyring is its OS credential store (OAuth tokens #915). #1621
-        "keyring>=24.0.0,<26.0.0",
-        "tavily-python>=0.5.0",
-        # Ed25519 signature verification for `gaia skill install` (#2467). Core,
-        # not an extra: a skill's security tier rests on its signature, and a
-        # build that cannot verify one would have to either refuse every signed
-        # skill or skip the check — neither is acceptable for a base install.
-        # Intel Macs stay <49: 49+ has no x86_64 macOS wheel and its sdist needs
-        # Rust. Elsewhere it is uncapped, so they keep 49/50's security fixes.
-        "cryptography>=42.0.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-        "cryptography>=42.0.0,<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
-        # gaia.daemon locks the sidecar launch-secret file down with an
-        # owner-only NTFS DACL (#2250) — chmod 0600 is inert on Windows. Core,
-        # not an extra: without win32security the daemon cannot spawn ANY
-        # sidecar. Distinct from keyring's pywin32-ctypes, which has no
-        # win32security module.
-        'pywin32; sys_platform == "win32"',
     ],
     extras_require={
-        # Live-browser automation (BrowserUseToolsMixin). Deliberately an
-        # extra, not core: Playwright downloads a ~200 MB Chromium, which no
-        # user who never drives a browser should pay for. The mixin registers
-        # nothing when it is absent.
-        "browser": [
-            "playwright>=1.45.0",
-        ],
-        "image": [
-            "term-image>=0.7.0,<0.8",
-        ],
         "api": [
             "fastapi>=0.115.0",
             "uvicorn>=0.32.0",
             "python-multipart>=0.0.9",
-            # Async client for the /v1/<agent>/* daemon relay (#2178): the API
-            # server streams SSE from the daemon unbuffered via httpx. This is
-            # the sole path to agent surfaces now — no agent is mounted
-            # in-process (#2176), so [api] carries no per-agent deps (keyring is
-            # already a core install_requires dep for `gaia connectors`, #1621).
-            # <1.0: httpx 1.0 drops the top-level get()/HTTPError/ConnectError GAIA calls.
-            "httpx>=0.27.0,<1.0",
-            # The daemon relies on psutil for every liveness check and
-            # _check_daemon_deps refuses to start without it. Also core; kept
-            # here so [api] alone still names every daemon dep.
-            "psutil>=5.9.0",
         ],
-        "ui": [
-            "fastapi>=0.115.0",
-            "uvicorn>=0.32.0",
-            "python-multipart>=0.0.9",
-            "httpx>=0.27.0,<1.0",
-            "psutil>=5.9.0",
-            # OAuth connections (issue #915): keyring stores refresh tokens in
-            # the OS credential store (macOS Keychain, Windows DPAPI, Linux
-            # SecretService). Pinned upper bound per supply-chain advisory.
-            "keyring>=24.0.0,<26.0.0",
-            # RAG runtime deps — gaia.rag.sdk uses faiss/pypdf/pymupdf/numpy and
-            # embeds via Lemonade (NOT sentence-transformers). See #845.
-            # Version specifiers match the standalone "rag" extra.
-            "faiss-cpu>=1.7.0",
-            "numpy>=1.24.0",
-            "pymupdf>=1.24.0,<2",
-            "pypdf",
-            "python-pptx>=0.6.21",
-            "python-docx>=1.1.0",
-            "openpyxl>=3.1.0",
-            "reportlab>=4.0.0",
-            # No torch / sentence-transformers: every model the UI uses is
-            # served by Lemonade, and torch's libomp aborts faiss on macOS.
+        "audio": [
+            "torch>=2.0.0,<2.4",
+            "torchvision<0.19.0",
+            "torchaudio",
         ],
-        # Speaker diarization. Its own extra: this is a
-        # ~29 MB native wheel (Apache-2.0; the onnxruntime it vendors is MIT)
-        # with no torch in it, and the frozen agent needs it BUNDLED — the
-        # lazy pip-install path cannot work inside a PyInstaller app, where
-        # sys.executable is the .exe rather than an interpreter.
-        "diarize": [
-            "sherpa-onnx>=1.13,<2",
+        "blender": [
+            "bpy",
         ],
         "mcp": [
-            # Supports mcp 2.x: its public MCPServer API replaced
-            # mcp.server.fastmcp (FastMCP). Keep the upper bound below the next
-            # incompatible major release.
-            "mcp>=2.0.0,<3.0",
+            "mcp>=1.1.0",
             "starlette",
             "uvicorn",
         ],
-        "telegram": [
-            "python-telegram-bot>=20.3",
-            "psutil>=5.9.0",
-        ],
-        "slack": [
-            "slack-sdk>=3.27",
-            "psutil>=5.9.0",
-        ],
         "dev": [
             "pytest",
-            "pytest-cov",
             "pytest-benchmark",
             "pytest-mock",
             "pytest-asyncio",
-            "pytest-xdist",
-            "pytest-rerunfailures",
-            "pyfakefs",
+            "memory_profiler",
             "matplotlib",
+            "adjustText",
+            "plotly",
             "black",
             "pylint",
             "isort",
@@ -267,67 +129,32 @@ setup(
             "autoflake",
             "mypy",
             "bandit",
-            # CVSS 4.0 scoring for the security-audit workflow (util/cvss4.py,
-            # util/findings_to_sarif.py). Pinned: its 4.0 scores match the FIRST
-            # v4 calculator, which the audit's scores must agree with.
-            "cvss>=3.6,<4.0",
             "responses",
             "requests",
-            # gaia.connectors runtime deps surfaced in [dev] so that
-            # `pip install -e ".[dev]"` is sufficient to run the unit suite
-            # without pulling in the heavier [ui] extra.
-            "httpx>=0.27.0,<0.29.0",
-            "respx>=0.21.0,<0.24.0",
-            "keyring>=24.0.0,<26.0.0",
-            # Tokenizer proxy for the tool-prompt cost harness (#1448,
-            # gaia.eval.tool_cost) so the budget test can count tokens.
-            "tiktoken>=0.7.0,<1.0.0",
-            # OpenAPI response-body validation against the committed spec
-            # (tests/test_email_openapi_conformance.py, #1897).
-            "jsonschema>=4.0.0,<5.0.0",
         ],
         "eval": [
             "anthropic",
             "bs4",
+            "scikit-learn>=1.5.0",
             "numpy>=2.0,<2.3.0",
             "pypdf",
             "reportlab",
-            # Tool-prompt cost measurement (#1448): tiktoken cl100k_base proxy.
-            "tiktoken>=0.7.0,<1.0.0",
-            # Wikipedia distractors for `gaia eval retrieval` scale tiers (parquet).
-            "pyarrow",
         ],
-        # Microphone and speaker I/O for `gaia talk`. Speech recognition
-        # (Whisper) and voice output (Kokoro) both run inside Lemonade Server,
-        # so this extra carries no model runtime — do NOT add torch, whisper or
-        # kokoro back here.
         "talk": [
+            "openai-whisper",
+            "kokoro>=0.3.1",
+            "soundfile",
             "sounddevice",
-            # WebSocket transport for the Lemonade Realtime transcription work
-            # tracked in #372; #382 stages the packaging dependency first.
-            "websockets",
+            "psutil",
         ],
         "youtube": [
             "llama-index-readers-youtube-transcript",
         ],
         "rag": [
-            # RAG embeds via Lemonade, not sentence-transformers — do NOT add it.
-            "faiss-cpu>=1.7.0",
-            "numpy>=1.24.0",
-            # 2.x ships no macOS x86_64 wheel and its sdist doesn't build. No
-            # platform marker: `gaia init` refuses to evaluate one (install_hints).
-            "pymupdf>=1.24.0,<2",
             "pypdf",
-            # Reading AND writing the common office formats. The read half is
-            # what RAG needs; the write half is what the document skills need,
-            # and this is the extra `gaia init --profile chat` installs. Without
-            # openpyxl and reportlab the pdf and xlsx skills load fine and then
-            # cannot do their job — the agent hand-writes raw PDF and raw OOXML
-            # instead, which works and is not a plan.
-            "python-pptx>=0.6.21",
-            "python-docx>=1.1.0",
-            "openpyxl>=3.1.0",
-            "reportlab>=4.0.0",
+            "pymupdf>=1.24.0",
+            "sentence-transformers",
+            "faiss-cpu>=1.7.0",
         ],
         "lint": [
             "black",
@@ -338,22 +165,6 @@ setup(
             "mypy",
             "bandit",
         ],
-        # Agent Hub packaging/publishing toolchain (issues #1093, #1179):
-        # 'gaia agent pack' shells out to 'python -m build', 'gaia agent publish'
-        # to 'twine upload'. Kept out of [dev] so the unit suite stays lean.
-        # install with 'pip install "amd-gaia[publish]"' to package an agent.
-        "publish": [
-            "build>=1.0.0",
-            # Agent pyprojects build with setuptools; `build --no-isolation` needs it here.
-            "setuptools>=61.0",
-            "twine>=5.0.0",
-        ],
-        # NOTE: no 'agent-<id>' / 'agents' extras here -- see
-        # AGENT_WHEEL_PACKAGES above for why (#2240) and where that list
-        # actually lives now. Install an agent from source until the wheels
-        # are published:
-        #   uv pip install "gaia-agent-<id> @ git+https://github.com/amd/gaia.git#subdirectory=hub/agents/<id>/python"
-        # (see gaia.agents.install_hints.source_install_command).
     },
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -371,6 +182,8 @@ setup(
             "gaia = gaia.cli:main",
             "gaia-cli = gaia.cli:main",
             "gaia-mcp = gaia.mcp.mcp_bridge:main",
+            "gaia-emr = gaia.agents.emr.cli:main",
+            "gaia-code = gaia.agents.code.cli:main",
         ]
     },
     python_requires=">=3.10",

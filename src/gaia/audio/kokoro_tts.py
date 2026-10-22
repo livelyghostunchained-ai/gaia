@@ -1,56 +1,197 @@
 # Copyright(C) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Kokoro voice output for ``gaia talk``, synthesized by Lemonade Server.
-
-Speech comes from Lemonade's ``kokoro-v1`` model; this module owns sentence
-chunking and live playback through the speakers.
-"""
 
 import queue
 import threading
 import time
 
 import numpy as np
+import psutil
 
 try:
     import sounddevice as sd
 except ImportError:
     sd = None
 
-from gaia.audio.lemonade_tts import (
-    DEFAULT_VOICE,
-    KOKORO_VOICES,
-    TTS_SAMPLE_RATE,
-    LemonadeTTSClient,
-    LemonadeTTSError,
-    write_wav,
-)
+try:
+    import soundfile as sf
+except ImportError:
+    sf = None
+
+try:
+    from kokoro import KPipeline
+except ImportError:
+    KPipeline = None
+
 from gaia.logger import get_logger
 
 
 class KokoroTTS:
     log = get_logger(__name__)
-    PLAYBACK_TIMEOUT_SLACK = 5.0
 
-    def __init__(self, base_url=None, client=None, say=None):
-        """
-        Args:
-            base_url: Lemonade API root; defaults to ``LEMONADE_BASE_URL``.
-            client: A ready :class:`LemonadeTTSClient` (tests inject one).
-            say: Called with a line before the voice model is downloaded.
+    def __init__(self):
+        # Check for required dependencies
+        missing = []
+        if sd is None:
+            missing.append("sounddevice")
+        if sf is None:
+            missing.append("soundfile")
+        if KPipeline is None:
+            missing.append("kokoro>=0.3.1")
 
-        Raises:
-            ConnectionError: Lemonade Server is not reachable.
-            LemonadeTTSError: Lemonade cannot serve the Kokoro model.
-        """
+        if missing:
+            error_msg = (
+                f"\n❌ Error: Missing required talk dependencies: {', '.join(missing)}\n\n"
+                f"Please install the talk dependencies:\n"
+                f'  uv pip install "amd-gaia[talk]"\n\n'
+                f"Or install packages directly:\n"
+                f"  uv pip install {' '.join(missing)}\n"
+            )
+            raise ImportError(error_msg)
+
         self.log = self.__class__.log
-        self.client = client or LemonadeTTSClient(base_url=base_url)
-        self.client.ensure_model(say=say)
+
+        # Initialize Kokoro pipeline with American English
+        self.pipeline = KPipeline(lang_code="a")  # 'a' for American English
 
         # Available voice configurations with metadata
-        self.available_voices = KOKORO_VOICES
+        self.available_voices = {
+            # American English Voices 🇸
+            "af_alloy": {
+                "name": "American Female - Alloy",
+                "quality": "C",
+                "duration": "MM",
+            },
+            "af_aoede": {
+                "name": "American Female - Aoede",
+                "quality": "C+",
+                "duration": "H",
+            },
+            "af_bella": {
+                "name": "American Female - Bella",
+                "quality": "A-",
+                "duration": "HH",
+            },
+            "af_jessica": {
+                "name": "American Female - Jessica",
+                "quality": "D",
+                "duration": "MM",
+            },
+            "af_kore": {
+                "name": "American Female - Kore",
+                "quality": "C+",
+                "duration": "H",
+            },
+            "af_nicole": {
+                "name": "American Female - Nicole",
+                "quality": "B-",
+                "duration": "HH",
+            },
+            "af_nova": {
+                "name": "American Female - Nova",
+                "quality": "C",
+                "duration": "MM",
+            },
+            "af_river": {
+                "name": "American Female - River",
+                "quality": "D",
+                "duration": "MM",
+            },
+            "af_sarah": {
+                "name": "American Female - Sarah",
+                "quality": "C+",
+                "duration": "H",
+            },
+            "af_sky": {
+                "name": "American Female - Sky",
+                "quality": "C-",
+                "duration": "M",
+            },
+            "am_adam": {
+                "name": "American Male - Adam",
+                "quality": "F+",
+                "duration": "H",
+            },
+            "am_echo": {
+                "name": "American Male - Echo",
+                "quality": "D",
+                "duration": "MM",
+            },
+            "am_eric": {
+                "name": "American Male - Eric",
+                "quality": "D",
+                "duration": "MM",
+            },
+            "am_fenrir": {
+                "name": "American Male - Fenrir",
+                "quality": "C+",
+                "duration": "H",
+            },
+            "am_liam": {
+                "name": "American Male - Liam",
+                "quality": "D",
+                "duration": "MM",
+            },
+            "am_michael": {
+                "name": "American Male - Michael",
+                "quality": "C+",
+                "duration": "H",
+            },
+            "am_onyx": {
+                "name": "American Male - Onyx",
+                "quality": "D",
+                "duration": "MM",
+            },
+            "am_puck": {
+                "name": "American Male - Puck",
+                "quality": "C+",
+                "duration": "H",
+            },
+            # British English Voices 🇧
+            "bf_alice": {
+                "name": "British Female - Alice",
+                "quality": "D",
+                "duration": "MM",
+            },
+            "bf_emma": {
+                "name": "British Female - Emma",
+                "quality": "B-",
+                "duration": "HH",
+            },
+            "bf_isabella": {
+                "name": "British Female - Isabella",
+                "quality": "C",
+                "duration": "MM",
+            },
+            "bf_lily": {
+                "name": "British Female - Lily",
+                "quality": "D",
+                "duration": "MM",
+            },
+            "bm_daniel": {
+                "name": "British Male - Daniel",
+                "quality": "D",
+                "duration": "MM",
+            },
+            "bm_fable": {
+                "name": "British Male - Fable",
+                "quality": "C",
+                "duration": "MM",
+            },
+            "bm_george": {
+                "name": "British Male - George",
+                "quality": "C",
+                "duration": "MM",
+            },
+            "bm_lewis": {
+                "name": "British Male - Lewis",
+                "quality": "D+",
+                "duration": "H",
+            },
+        }
 
-        self.voice_name = DEFAULT_VOICE
+        # Default to highest quality voice (Bella)
+        self.voice_name = "af_bella"
         self.chunk_size = 150  # Optimal token chunk size for best quality
         self.log.debug(
             f"Loaded voice: {self.voice_name} - {self.available_voices[self.voice_name]['name']} (Quality: {self.available_voices[self.voice_name]['quality']})"
@@ -84,9 +225,7 @@ class KokoroTTS:
                 # For list items, ensure we add pause regardless of existing punctuation
                 if line[-1] in ".!?:":
                     line = line[:-1]  # Remove existing punctuation
-                # Replace only the list marker paren, not all parens in the line
-                if len(line) > 1 and line[1] == ")":
-                    line = line[0] + "..." + line[2:]
+                line = line.replace(")", "...")  # Add pause after list items
                 processed_lines.append(f"{line}...")
             else:
                 # Add a period at the end of non-empty lines if they don't already have ending punctuation
@@ -97,173 +236,128 @@ class KokoroTTS:
 
         return " ".join(processed_lines)  # Join with spaces instead of newlines
 
-    def generate_speech(self, text: str, stream_callback=None) -> tuple:
-        """Speak *text* through Lemonade, chunked by sentence for early playback.
-
-        Returns:
-            ``(audio, stats)`` — float32 samples at ``TTS_SAMPLE_RATE`` and
-            timing stats.
-        """
+    def generate_speech(
+        self, text: str, stream_callback=None
+    ) -> tuple[list[float], str, dict]:
+        """Generate speech from text using Kokoro TTS with quality optimizations."""
         self.log.debug(f"Generating speech for text of length {len(text)}")
+
+        process = psutil.Process()
+        start_memory = process.memory_info().rss / 1024 / 1024
         start_time = time.time()
+
+        # Generate audio using the pipeline with chunking for optimal quality
         audio_chunks = []
+        phonemes = []
+        total_duration = 0
 
-        def speak(chunk_text):
-            audio, rate = self.client.synthesize(chunk_text, voice=self.voice_name)
-            if rate != TTS_SAMPLE_RATE:
-                raise LemonadeTTSError(
-                    f"Lemonade returned {rate} Hz speech; playback is opened at "
-                    f"{TTS_SAMPLE_RATE} Hz. Check the Lemonade Server version."
-                )
-            audio_chunks.append(audio)
-            if stream_callback and callable(stream_callback):
-                stream_callback(audio)
-
-        # Sentence-sized requests keep the first audio close to the first text.
+        # Split text into chunks of optimal size (100-200 tokens)
+        sentences = text.split(".")
         current_chunk = []
         current_length = 0
-        for sentence in text.split("."):
+
+        for sentence in sentences:
             sentence = sentence.strip()
             if not sentence:
                 continue
-            sentence_length = len(sentence.split())
-            if current_chunk and current_length + sentence_length > self.chunk_size:
-                speak(". ".join(current_chunk) + ".")
-                current_chunk = []
-                current_length = 0
-            current_chunk.append(sentence)
-            current_length += sentence_length
-        if current_chunk:
-            speak(". ".join(current_chunk) + ".")
 
-        if audio_chunks:
-            audio = np.concatenate(audio_chunks)
-        else:
-            audio = np.zeros(TTS_SAMPLE_RATE // 10, dtype=np.float32)
-        processing_time = time.time() - start_time
-        total_duration = len(audio) / TTS_SAMPLE_RATE if audio_chunks else 0.0
+            sentence_length = len(sentence.split())
+
+            if current_length + sentence_length > self.chunk_size:
+                # Process current chunk
+                chunk_text = ". ".join(current_chunk) + "."
+                generator = self.pipeline(chunk_text, voice=self.voice_name, speed=1)
+                for _, phoneme_seq, audio in generator:
+                    audio_chunks.append(audio)
+                    phonemes.append(phoneme_seq)
+                    chunk_duration = len(audio) / 24000
+                    total_duration += chunk_duration
+
+                    if stream_callback and callable(stream_callback):
+                        stream_callback(audio)
+
+                current_chunk = [sentence]
+                current_length = sentence_length
+            else:
+                current_chunk.append(sentence)
+                current_length += sentence_length
+
+        # Process remaining chunk if any
+        if current_chunk:
+            chunk_text = ". ".join(current_chunk) + "."
+            generator = self.pipeline(chunk_text, voice=self.voice_name, speed=1)
+            for _, phoneme_seq, audio in generator:
+                audio_chunks.append(audio)
+                phonemes.append(phoneme_seq)
+                chunk_duration = len(audio) / 24000
+                total_duration += chunk_duration
+
+                if stream_callback and callable(stream_callback):
+                    stream_callback(audio)
+
+        # Combine all audio chunks
+        audio = np.concatenate(audio_chunks)
+        combined_phonemes = " ".join(phonemes)
+
+        end_time = time.time()
+        end_memory = process.memory_info().rss / 1024 / 1024
+        processing_time = end_time - start_time
+        peak_memory = end_memory - start_memory
+
         stats = {
             "processing_time": round(processing_time, 3),
             "audio_duration": round(total_duration, 3),
-            "realtime_ratio": (
-                round(processing_time / total_duration, 2)
-                if total_duration > 0
-                else 0.0
-            ),
+            "realtime_ratio": round(processing_time / total_duration, 2),
+            "peak_memory": round(peak_memory, 2),
         }
-        return audio, stats
 
-    @staticmethod
-    def _drain_text_queue(text_queue: queue.Queue) -> None:
-        """Consume until the producer's terminator, so it never blocks.
-
-        The producer puts onto a bounded queue; with no consumer it wedges at
-        100 chunks and the LLM stream stops mid-answer.
-        """
-        while True:
-            try:
-                item = text_queue.get(timeout=30.0)
-            except queue.Empty:
-                return
-            if item in ("__END__", "__HALT__", None):
-                return
-
-    @staticmethod
-    def _require_sounddevice() -> None:
-        if sd is None:
-            raise ImportError(
-                "sounddevice is required to play speech.\n"
-                'Install it with: uv pip install "amd-gaia[talk]"'
-            )
+        return audio, combined_phonemes, stats
 
     def generate_speech_streaming(
         self, text_queue: queue.Queue, status_callback=None, interrupt_event=None
     ) -> None:
         """Optimized streaming TTS with separate processing and playback threads."""
-        self._require_sounddevice()
         self.log.debug("Starting speech streaming")
         buffer = ""
         audio_buffer = queue.Queue(maxsize=100)  # Buffer for processed audio chunks
-        audio_duration = 0.0
-        playback_errors = []
-        stop_playback = threading.Event()
 
-        def enqueue_audio(audio):
-            nonlocal audio_duration
-            audio_duration += len(audio) / TTS_SAMPLE_RATE
-            try:
-                audio_buffer.put(
-                    audio, timeout=audio_duration + self.PLAYBACK_TIMEOUT_SLACK
-                )
-            except queue.Full as error:
-                raise TimeoutError(
-                    "Audio output stalled while buffering playback"
-                ) from error
-
-        # Initialize audio stream. Inside a try: this used to raise straight out
-        # of the TTS thread, and the producer then blocked forever on a full
-        # text_queue — a broken speaker froze the whole answer (#3554).
-        try:
-            stream = sd.OutputStream(
-                samplerate=TTS_SAMPLE_RATE,
-                channels=1,
-                dtype=np.float32,
-                blocksize=TTS_SAMPLE_RATE // 10,  # 100ms buffer
-                latency="low",
-            )
-            stream.start()
-        except Exception as e:
-            message = (
-                f"Speaker unavailable: could not open audio output ({e}). "
-                "The reply is shown as text; voice output is off for this "
-                "session."
-            )
-            self.log.error(message)
-            print(f"\n{message}")
-            # Keep draining so the producer can finish its stream. Returning
-            # here would leave it blocked on a queue nobody reads.
-            self._drain_text_queue(text_queue)
-            if status_callback:
-                status_callback(False)
-            return
+        # Initialize audio stream
+        stream = sd.OutputStream(
+            samplerate=24000,
+            channels=1,
+            dtype=np.float32,
+            blocksize=2400,  # 100ms buffer
+            latency="low",
+        )
+        stream.start()
         self.log.debug("Audio stream initialized")
 
         # Playback thread function
         def audio_playback_thread():
-            playing = True
             try:
-                while not stop_playback.is_set():
+                while True:
                     try:
                         audio_chunk = audio_buffer.get(timeout=0.1)
+                        if audio_chunk is None:  # Exit signal
+                            if status_callback:
+                                status_callback(False)
+                            break
+                        if interrupt_event and interrupt_event.is_set():
+                            break
+                        if status_callback:
+                            status_callback(True)
+                        stream.write(np.array(audio_chunk, dtype=np.float32))
                     except queue.Empty:
                         continue
-                    if audio_chunk is None:  # Exit signal
-                        break
-                    # Keep draining after an interrupt or device error: the
-                    # synthesis side blocks on a full buffer otherwise.
-                    if not playing or (interrupt_event and interrupt_event.is_set()):
-                        continue
-                    if status_callback:
-                        status_callback(True)
-                    try:
-                        stream.write(np.array(audio_chunk, dtype=np.float32))
-                    except Exception as e:
-                        playback_errors.append(e)
-                        playing = False
             except Exception as e:
-                playback_errors.append(e)
+                self.log.error(f"Error in playback thread: {e}")
+                if status_callback:
+                    status_callback(False)
             finally:
-                try:
-                    stream.stop()
-                except Exception as e:
-                    playback_errors.append(e)
-                finally:
-                    try:
-                        stream.close()
-                        if status_callback:
-                            status_callback(False)
-                    except Exception as e:
-                        playback_errors.append(e)
+                stream.stop()
+                stream.close()
+                if status_callback:
+                    status_callback(False)
 
         # Start playback thread
         playback_thread = threading.Thread(target=audio_playback_thread)
@@ -273,8 +367,6 @@ class KokoroTTS:
         try:
             while True:
                 try:
-                    if interrupt_event and interrupt_event.is_set():
-                        break
                     chunk = text_queue.get(timeout=0.1)
 
                     if chunk == "__END__" or (
@@ -285,8 +377,9 @@ class KokoroTTS:
                             processed_text = self.preprocess_text(buffer.strip())
                             if processed_text:  # Only process if there's actual text
                                 self.generate_speech(
-                                    processed_text, stream_callback=enqueue_audio
+                                    processed_text, stream_callback=audio_buffer.put
                                 )
+                        audio_buffer.put(None)  # Signal playback thread to exit
                         break
 
                     buffer += chunk
@@ -302,34 +395,19 @@ class KokoroTTS:
                             processed_text = self.preprocess_text(text_to_process)
                             if processed_text:  # Double check after preprocessing
                                 self.generate_speech(
-                                    processed_text, stream_callback=enqueue_audio
+                                    processed_text, stream_callback=audio_buffer.put
                                 )
                         buffer = sentences[-1]
 
                 except queue.Empty:
                     continue
 
+        except Exception as e:
+            self.log.error(f"Error in streaming: {e}")
+            audio_buffer.put(None)  # Ensure playback thread exits
         finally:
-            deadline = time.monotonic() + audio_duration + self.PLAYBACK_TIMEOUT_SLACK
-            try:
-                audio_buffer.put(None, timeout=max(0, deadline - time.monotonic()))
-            except queue.Full as error:
-                stop_playback.set()
-                raise TimeoutError(
-                    "Audio output stalled while finishing playback"
-                ) from error
-            playback_thread.join(timeout=max(0, deadline - time.monotonic()))
-            if playback_thread.is_alive():
-                stop_playback.set()
-                raise TimeoutError(
-                    "Audio playback exceeded its duration plus cleanup allowance; "
-                    "microphone remains paused. Restart voice chat after checking "
-                    "the output device."
-                )
-            if playback_errors:
-                raise RuntimeError(
-                    f"Audio playback failed: {playback_errors[0]}"
-                ) from playback_errors[0]
+            audio_buffer.put(None)  # Ensure playback thread exits
+            playback_thread.join(timeout=2.0)
 
     def set_voice(self, voice_name: str) -> None:
         """Change the current voice."""
@@ -369,26 +447,25 @@ class KokoroTTS:
         """Test basic audio generation and file saving."""
         try:
             print("\nGenerating audio...")
-            audio, stats = self.generate_speech(test_text)
+            audio, _, stats = self.generate_speech(test_text)
 
-            write_wav(output_file, audio, TTS_SAMPLE_RATE)
+            # Save audio to file
+            sf.write(output_file, np.array(audio), 24000)
             print(f"Saved audio to: {output_file}")
 
             print("\nPerformance stats:")
             print(f"- Processing time: {stats['processing_time']:.3f}s")
             print(f"- Audio duration: {stats['audio_duration']:.3f}s")
             print(f"- Realtime ratio: {stats['realtime_ratio']:.2f}x (lower is better)")
+            print(f"- Peak memory usage: {stats['peak_memory']:.2f} MB")
         except Exception as e:
             self.log.error(f"Error during audio generation test: {e}")
 
     def test_streaming_playback(self, test_text: str) -> None:
         """Test streaming audio generation with progress display."""
-        self._require_sounddevice()
         try:
             # Setup audio stream
-            stream = sd.OutputStream(
-                samplerate=TTS_SAMPLE_RATE, channels=1, dtype=np.float32
-            )
+            stream = sd.OutputStream(samplerate=24000, channels=1, dtype=np.float32)
             stream.start()
 
             # Create audio queue and initialize tracking variables
@@ -408,12 +485,6 @@ class KokoroTTS:
 
             print("\nAnalyzing text length...")
             self.generate_speech(test_text, stream_callback=count_chunks)
-
-            if total_chunks == 0:
-                print("No audio chunks generated from input text.")
-                stream.stop()
-                stream.close()
-                return
 
             # Define and start streaming thread
             def stream_audio():
@@ -476,7 +547,7 @@ class KokoroTTS:
                 audio_queue.put(chunk)
 
             processed_text = self.preprocess_text(test_text)
-            _, stats = self.generate_speech(
+            _, _, stats = self.generate_speech(
                 processed_text, stream_callback=process_chunk
             )
 
