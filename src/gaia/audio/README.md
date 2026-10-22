@@ -2,17 +2,72 @@
 
 This guide helps diagnose and fix audio-related issues with GAIA's voice features (talk mode, voice chat, etc.).
 
-Speech recognition (Whisper) and voice output (Kokoro) both run inside Lemonade
-Server. GAIA records the microphone, sends each utterance to
-`/api/v1/audio/transcriptions`, and plays what `/api/v1/audio/speech` returns.
-There is no local speech model and no fallback to one.
+## Test Utilities
+
+The `tests/` folder contains diagnostic tools for troubleshooting:
+
+- **`test_mic_simple.py`** - Basic microphone test showing real-time audio levels
+- **`test_talk_basic.py`** - Simple 3-second recording and transcription loop  
+- **`test_audio_pipeline.py`** - Comprehensive test of all audio components
 
 ## Quick Diagnostics
 
-### Test Live Transcription
+### 1. Test Your Microphone (Basic Level)
+
+First, verify your microphone is working at the hardware level:
 
 ```bash
-gaia test --test-type asr-microphone --recording-duration 20
+# Run the simple microphone test
+python src/gaia/audio/tests/test_mic_simple.py
+```
+
+**Expected Output:** You should see energy bars (█████) when you speak:
+```
+███████████                                        0.011151
+█████████████████                                  0.017035
+██████████████████████████                         0.026203
+```
+
+If you see only "(silence)" or very low values, your microphone isn't being captured properly.
+
+### 2. Test Basic Whisper Transcription
+
+Test if Whisper can transcribe your audio in a simple loop:
+
+```bash
+# Run the basic talk test (3-second recordings)
+python src/gaia/audio/tests/test_talk_basic.py
+```
+
+This will record 3 seconds of audio, transcribe it, and show the result. You should see:
+```
+Recording for 3 seconds... SPEAK NOW!
+Audio captured: 49152 samples, energy: 0.025000
+Transcribing...
+✅ TRANSCRIBED: Hello, this is a test
+```
+
+### 3. Comprehensive Audio Pipeline Test
+
+For a complete diagnostic of all components:
+
+```bash
+# Run the full audio pipeline test
+python src/gaia/audio/tests/test_audio_pipeline.py
+```
+
+This tests:
+- Basic microphone functionality
+- AudioRecorder class with voice activity detection  
+- Raw recording visualization
+- Full WhisperAsr integration
+
+### 4. Test Whisper ASR Module Directly
+
+Test the Whisper ASR module with streaming:
+
+```bash
+python src/gaia/audio/whisper_asr.py --mode mic --stream --duration 20
 ```
 
 ## Logging and Verbosity
@@ -21,7 +76,8 @@ gaia test --test-type asr-microphone --recording-duration 20
 - Use `--logging-level DEBUG` to see low-level audio processing details, including:
   - Audio device selection and stream start
   - Per-chunk enqueue events and energies
-  - Per-utterance transcription text and Lemonade round-trip time
+  - Batch processing cycles
+  - Per-segment transcription text
   - ASR/LLM coordination events during TTS streaming
 - For minimal noise, run with `--logging-level WARNING`.
 
@@ -30,7 +86,8 @@ gaia test --test-type asr-microphone --recording-duration 20
 ### Issue 1: No Audio Detected
 
 **Symptoms:**
-- Energy levels in the DEBUG log show 0.000000 or very low values (< 0.0001)
+- Energy levels show 0.000000 or very low values (< 0.0001)
+- No energy bars appear when speaking
 
 **Solutions:**
 1. **Check Windows Settings:**
@@ -46,8 +103,8 @@ gaia test --test-type asr-microphone --recording-duration 20
 3. **Select Correct Device:**
    ```bash
    # List all audio devices
-   python -c "import sounddevice as sd; [print(f'{d[\"index\"]}: {d[\"name\"]}') for d in sd.query_devices() if d.get('max_input_channels', 0) > 0]"
-
+   python -c "import sounddevice as sd; [print(f'{i}: {d[\"name\"]}') for i, d in enumerate(sd.query_devices()) if d.get('max_input_channels', 0) > 0]"
+   
    # Use specific device (replace 0 with your device number)
    gaia talk --audio-device-index 0 --no-tts
    ```
@@ -55,16 +112,16 @@ gaia test --test-type asr-microphone --recording-duration 20
 ### Issue 2: Audio Detected but No Transcription
 
 **Symptoms:**
-- DEBUG log shows speech-level energy when speaking
+- Energy bars appear when speaking
 - Talk mode shows "Listening..." but never transcribes
 - No text output despite speaking
 
 **Solutions:**
 1. **Voice Detection Threshold:**
    - The system may be too strict about what counts as "speech"
-  - The VAD (amplitude) threshold in `WhisperAsr` comes from `--mic-threshold` (default 0.003)
+  - The internal VAD (amplitude) threshold in `WhisperAsr` defaults to ~0.01, tuned for typical speaking levels (0.02–0.03)
   - The CLI flag `--silence-threshold` controls pause duration (in seconds) before sending the last heard phrase to the LLM, not the amplitude threshold
-  - If detection is unreliable, check the per-chunk energy values in the DEBUG log and reduce background noise
+  - If detection is unreliable, verify your energy levels with the mic test and reduce background noise
 
 2. **Use Smaller Whisper Model:**
    ```bash
@@ -79,7 +136,7 @@ gaia test --test-type asr-microphone --recording-duration 20
    Look for messages like:
    - `Chunk X: energy=0.00XXXX, is_speech=True/False`
    - `Adding speech to queue: XXXXX samples`
-   - `Transcribed 1.8s of audio in 0.12s: 'your text here'`
+   - `Transcribed: your text here`
 
 ### Issue 3: Poor Transcription Quality
 
@@ -103,8 +160,10 @@ gaia test --test-type asr-microphone --recording-duration 20
    - Pause briefly between sentences
    - Avoid background noise
 
-3. **Try the turbo model:** `gaia talk --whisper-model-size turbo` uses
-   `Whisper-Large-v3-Turbo`, near-large accuracy at a fraction of the cost.
+3. **Enable CUDA (if available):**
+   ```bash
+   gaia talk --whisper-model-size small --cuda
+   ```
 
 ### Issue 4: TTS Not Working
 
@@ -118,11 +177,10 @@ gaia test --test-type asr-microphone --recording-duration 20
    gaia talk --no-tts
    ```
 
-2. **Check the Kokoro model in Lemonade:**
-   - The first `gaia talk` downloads `kokoro-v1` (~350 MB) through Lemonade
-     and prints `Downloading kokoro-v1 through Lemonade` while it does
-   - `gaia test --test-type tts-audio-file` writes speech to a WAV without
-     needing a speaker, which separates a Lemonade problem from an audio-device one
+2. **Check Kokoro TTS Installation:**
+   - Kokoro TTS loads a model on first use which can be slow
+   - Wait for the model to download (shows progress)
+   - A warning like "Defaulting repo_id to hexgrad/Kokoro-82M" is harmless
 
 3. **Programmatic TTS (optional):**
    - If needed in code, you can call `AudioClient.speak_text("Hello")` after TTS has been initialized
@@ -137,17 +195,35 @@ gaia talk --no-tts --logging-level DEBUG --whisper-model-size tiny
 
 ### Test Individual Components
 
-**Test live transcription:**
+1. **Test Microphone Only:**
    ```bash
-   gaia test --test-type asr-microphone --recording-duration 20
+   # Simple microphone level test
+   python src/gaia/audio/tests/test_mic_simple.py
+   ```
+
+2. **Test Whisper Transcription:**
+   ```bash
+   # Basic 3-second recording and transcription loop
+   python src/gaia/audio/tests/test_talk_basic.py
+   ```
+
+3. **Test Full Pipeline:**
+   ```bash
+   # Comprehensive test of all audio components
+   python src/gaia/audio/tests/test_audio_pipeline.py
+   ```
+
+4. **Test Real-time Streaming:**
+   ```bash
+   # Test the WhisperAsr module directly with streaming
+   python src/gaia/audio/whisper_asr.py --mode mic --stream --duration 20
    ```
 
 ## Audio System Architecture
 
 ```
 Microphone → sounddevice → AudioRecorder → Voice Activity Detection →
-Audio Queue → WhisperAsr → Lemonade Whisper → Transcription Queue → LLM →
-Response → KokoroTTS → Lemonade kokoro-v1 → speakers
+Audio Queue → WhisperAsr → Transcription Queue → LLM → Response
 ```
 
 ### Key Components:
@@ -158,9 +234,9 @@ Response → KokoroTTS → Lemonade kokoro-v1 → speakers
    - Buffers audio segments
 
 2. **WhisperAsr** (`whisper_asr.py`):
-   - Pulls the Whisper model through Lemonade on first use
-   - Sends each utterance to Lemonade as a 16 kHz WAV
-   - Returns transcribed text; stops with `asr_error` if Lemonade fails
+   - Loads OpenAI Whisper model
+   - Processes audio chunks
+   - Returns transcribed text
 
 3. **AudioClient** (`audio_client.py`):
    - Orchestrates recording and transcription
@@ -169,14 +245,16 @@ Response → KokoroTTS → Lemonade kokoro-v1 → speakers
 
 ## Performance Tips
 
-1. **Model Selection** (download sizes as Lemonade reports them):
-   - `tiny` (`Whisper-Tiny`): fastest, ~75 MB, good for testing
-   - `base` (`Whisper-Base`): balanced, ~150 MB, the default
-   - `small`, `medium`, `large`, `turbo`: more accurate, larger downloads
+1. **Model Selection:**
+   - `tiny`: Fastest, ~39MB, good for testing
+   - `base`: Balanced, ~74MB, good quality
+   - `small`: Better accuracy, ~244MB
+   - `medium`: Best accuracy, ~769MB, slower
 
 2. **Reduce Latency:**
    - Use `--no-tts` to skip text-to-speech
    - Use smaller models (`tiny` or `base`)
+   - Enable CUDA with `--cuda` if you have GPU
 
 3. **Improve Accuracy:**
    - Use larger models (`small` or `medium`)
@@ -187,16 +265,23 @@ Response → KokoroTTS → Lemonade kokoro-v1 → speakers
 ## Environment Variables
 
 ```bash
-# Lemonade Server that transcribes and speaks
-export LEMONADE_BASE_URL=http://localhost:13305/api/v1
+# Set default audio device (optional)
+export GAIA_AUDIO_DEVICE=1
+
+# Set default Whisper model
+export GAIA_WHISPER_MODEL=small
+
+# Enable debug logging globally
+export GAIA_LOG_LEVEL=DEBUG
 ```
 
 ## Still Having Issues?
 
 1. **Verify Python Environment:**
    ```bash
-   python --version  # Should be 3.10+
-   pip show sounddevice  # Should be installed ([talk] extra)
+   python --version  # Should be 3.8+
+   pip show whisper       # Should be installed
+   pip show sounddevice   # Should be installed
    ```
 
 2. **Check System Audio:**
@@ -206,7 +291,7 @@ export LEMONADE_BASE_URL=http://localhost:13305/api/v1
 
 3. **File an Issue:**
    If problems persist, create an issue with:
-   - Output of `gaia test --test-type asr-microphone` above
+   - Output of the microphone test
    - Debug logs from `gaia talk --logging-level DEBUG`
    - Your system info (Windows version, Python version)
    - Audio device list from the diagnostic commands

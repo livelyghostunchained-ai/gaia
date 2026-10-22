@@ -1,61 +1,21 @@
 # Copyright(C) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Unit tests for AudioRecorder with mocked sounddevice."""
+"""Unit tests for AudioRecorder with sounddevice (no hardware required)."""
 
-import os
-import subprocess
-import sys
-import threading
-import time
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
 
-def test_voice_modules_never_load_a_local_model_runtime():
-    """Speech runs in Lemonade; torch's libomp also breaks faiss recall on macOS."""
-    src = Path(__file__).resolve().parents[2] / "src"
-    probe = (
-        "import sys, gaia.audio.whisper_asr, gaia.audio.kokoro_tts, "
-        "gaia.audio.audio_client; "
-        "print(sorted(m for m in ('torch', 'whisper', 'kokoro', 'transformers') "
-        "if m in sys.modules))"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env={**os.environ, "PYTHONPATH": str(src)},
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "[]"
-
-
 @pytest.fixture
 def mock_sd():
     """Mock sounddevice module."""
     with patch("gaia.audio.audio_recorder.sd") as mock:
-        # Mock query_devices for default device
-        mock.query_devices.return_value = {
-            "name": "Test Microphone",
-            "index": 0,
-            "max_input_channels": 2,
-            "default_samplerate": 16000.0,
-        }
-
-        # Mock InputStream
-        mock_stream = MagicMock()
-        # Return (frames, overflowed) where frames is (CHUNK, channels) shape
-        chunk_size = 2048
-        silence = np.zeros((chunk_size, 1), dtype=np.float32)
-        mock_stream.read.return_value = (silence, False)
-        mock.InputStream.return_value = mock_stream
-
+        mock.default.device = (3, 5)
+        mock.query_devices.return_value = {"name": "Test Microphone", "max_input_channels": 2}
+        mock.InputStream = MagicMock()
         yield mock
 
 
@@ -68,179 +28,112 @@ def recorder(mock_sd):
 
 
 class TestAudioRecorderInit:
-    def test_default_init(self, recorder):
-        assert recorder.RATE == 16000
-        assert recorder.CHANNELS == 1
+    def test_init_dtype(self, recorder):
+        """Verify DTYPE is set to float32 (not pyaudio format constant)."""
         assert recorder.DTYPE == "float32"
-        assert recorder.CHUNK == 2048
-        assert recorder.device_index == 0
-        assert not recorder.is_recording
+        assert not hasattr(recorder, "FORMAT")
 
-    def test_custom_device_index(self, mock_sd):
-        from gaia.audio.audio_recorder import AudioRecorder
-
-        rec = AudioRecorder(device_index=3)
-        assert rec.device_index == 3
-
-    def test_default_device_index(self, mock_sd):
-        from gaia.audio.audio_recorder import AudioRecorder
-
-        mock_sd.query_devices.return_value = {
-            "name": "Default Mic",
-            "index": 2,
-            "max_input_channels": 1,
-            "default_samplerate": 16000.0,
-        }
-        rec = AudioRecorder()
-        assert rec.device_index == 2
-
-    def test_missing_sounddevice_raises(self):
+    def test_init_raises_without_sounddevice(self):
+        """Verify ImportError when sounddevice is not available."""
         with patch("gaia.audio.audio_recorder.sd", None):
-            import gaia.audio.audio_recorder as mod
+            from gaia.audio.audio_recorder import AudioRecorder
 
-            # Re-assign sd to None to simulate missing import
-            original_sd = mod.sd
-            mod.sd = None
-            try:
-                with pytest.raises(ImportError, match="sounddevice"):
-                    mod.AudioRecorder()
-            finally:
-                mod.sd = original_sd
+            with pytest.raises(ImportError, match="sounddevice"):
+                AudioRecorder()
 
 
-class TestListDevices:
-    def test_list_audio_devices(self, recorder, mock_sd):
+class TestDefaultInputDevice:
+    def test_get_default_input_device(self, mock_sd):
+        """Verify default device index comes from sd.default.device."""
+        from gaia.audio.audio_recorder import AudioRecorder
+
+        recorder = AudioRecorder()
+        assert recorder.device_index == 3
+
+    def test_get_default_input_device_fallback(self, mock_sd):
+        """Verify fallback to 0 when sd.default.device fails."""
+        type(mock_sd.default).device = property(
+            lambda self: (_ for _ in ()).throw(Exception("no device"))
+        )
+        from gaia.audio.audio_recorder import AudioRecorder
+
+        recorder = AudioRecorder()
+        assert recorder.device_index == 0
+
+
+class TestListAudioDevices:
+    def test_list_audio_devices(self, mock_sd):
+        """Verify only input devices are returned with correct keys."""
         mock_sd.query_devices.return_value = [
-            {"name": "Mic 1", "index": 0, "max_input_channels": 2},
-            {"name": "Speaker", "index": 1, "max_input_channels": 0},
-            {"name": "Mic 2", "index": 2, "max_input_channels": 1},
+            {"name": "Microphone", "max_input_channels": 2, "max_output_channels": 0},
+            {"name": "Speaker", "max_input_channels": 0, "max_output_channels": 2},
+            {"name": "Headset", "max_input_channels": 1, "max_output_channels": 1},
         ]
+        from gaia.audio.audio_recorder import AudioRecorder
+
+        recorder = AudioRecorder(device_index=0)
         devices = recorder.list_audio_devices()
+
         assert len(devices) == 2
-        assert devices[0]["name"] == "Mic 1"
-        assert devices[1]["name"] == "Mic 2"
+        assert devices[0]["name"] == "Microphone"
+        assert devices[0]["index"] == 0
+        assert devices[0]["max_input_channels"] == 2
+        assert devices[1]["name"] == "Headset"
+        assert devices[1]["index"] == 2
 
 
 class TestGetDeviceName:
     def test_get_device_name(self, recorder, mock_sd):
-        mock_sd.query_devices.return_value = {
-            "name": "Test Microphone",
-            "index": 0,
-        }
-        assert recorder.get_device_name() == "Test Microphone"
+        """Verify device name is returned."""
+        mock_sd.query_devices.return_value = {"name": "Test Mic"}
+        assert recorder.get_device_name() == "Test Mic"
 
     def test_get_device_name_error(self, recorder, mock_sd):
-        mock_sd.query_devices.side_effect = Exception("Device error")
+        """Verify fallback on error."""
+        mock_sd.query_devices.side_effect = Exception("device error")
         name = recorder.get_device_name()
-        assert "Error" in name
+        assert "Device 0" in name
+        assert "device error" in name
 
 
-class TestRecording:
-    def test_start_stop_recording(self, recorder, mock_sd):
-        """Test that start/stop recording works without errors."""
-        # Make the stream read return silence quickly
-        mock_stream = mock_sd.InputStream.return_value
-        silence = np.zeros((2048, 1), dtype=np.float32)
-        mock_stream.read.return_value = (silence, False)
+class TestRecordAudio:
+    def test_record_opens_stream(self, recorder, mock_sd):
+        """Verify InputStream is created with correct params and lifecycle."""
+        mock_stream = MagicMock()
+        # Return silent audio frames then stop recording
+        silent_frames = np.zeros((recorder.CHUNK, 1), dtype=np.float32)
+        call_count = 0
 
-        recorder.start_recording()
-        assert recorder.is_recording
-        time.sleep(0.3)
-        recorder.stop_recording()
-        assert not recorder.is_recording
+        def fake_read(chunk_size):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 2:
+                recorder.is_recording = False
+            return silent_frames, False
 
-    def test_double_start_warning(self, recorder, mock_sd):
-        """Test that starting recording twice logs a warning."""
-        mock_stream = mock_sd.InputStream.return_value
-        silence = np.zeros((2048, 1), dtype=np.float32)
-        mock_stream.read.return_value = (silence, False)
+        mock_stream.read = fake_read
+        mock_sd.InputStream.return_value = mock_stream
 
-        recorder.start_recording()
-        recorder.start_recording()  # Should warn, not error
-        time.sleep(0.2)
-        recorder.stop_recording()
-
-    def test_speech_detection_queues_audio(self, recorder, mock_sd):
-        """Test that speech above threshold gets queued."""
-        mock_stream = mock_sd.InputStream.return_value
-
-        # Create audio data that exceeds the silence threshold
-        chunk_size = 2048
-        loud_audio = np.full((chunk_size, 1), 0.1, dtype=np.float32)
-        silence = np.zeros((chunk_size, 1), dtype=np.float32)
-
-        # Return loud audio for enough chunks, then silence to trigger queue
-        call_count = [0]
-
-        def read_side_effect(n):
-            call_count[0] += 1
-            if call_count[0] <= 15:  # Enough for speech + min length
-                return (loud_audio, False)
-            return (silence, False)
-
-        mock_stream.read.side_effect = read_side_effect
-
-        # Only start the record thread (not the process thread which drains the queue)
         recorder.is_recording = True
-        recorder.record_thread = threading.Thread(target=recorder._record_audio)
-        recorder.record_thread.start()
+        recorder._record_audio()
 
-        # Wait for speech detection and silence timeout
-        time.sleep(2.0)
-        recorder.is_recording = False
-        recorder.record_thread.join(timeout=2.0)
+        mock_sd.InputStream.assert_called_once_with(
+            samplerate=recorder.RATE,
+            channels=recorder.CHANNELS,
+            dtype=recorder.DTYPE,
+            device=recorder.device_index,
+            blocksize=recorder.CHUNK,
+        )
+        mock_stream.start.assert_called_once()
+        mock_stream.stop.assert_called_once()
+        mock_stream.close.assert_called_once()
 
-        # Should have detected speech and queued it
-        assert not recorder.audio_queue.empty()
 
-    def test_pause_resume(self, recorder, mock_sd):
-        """Test pause and resume functionality."""
-        mock_stream = mock_sd.InputStream.return_value
-        silence = np.zeros((2048, 1), dtype=np.float32)
-        mock_stream.read.return_value = (silence, False)
-
-        recorder.start_recording()
-        time.sleep(0.2)
-
+class TestPauseResume:
+    def test_pause_resume(self, recorder):
+        """Verify pause/resume flags."""
+        assert not recorder.is_paused
         recorder.pause_recording()
         assert recorder.is_paused
-
         recorder.resume_recording()
         assert not recorder.is_paused
-
-        recorder.stop_recording()
-
-
-class TestPauseAndCaptureFailure:
-    def test_pause_discards_mic_audio_but_keeps_draining(self, recorder, mock_sd):
-        """While paused the device is read and thrown away, never queued."""
-        mock_stream = mock_sd.InputStream.return_value
-        loud_audio = np.full((2048, 1), 0.1, dtype=np.float32)
-        mock_stream.read.return_value = (loud_audio, False)
-
-        recorder.pause_recording()
-        recorder.is_recording = True
-        recorder.record_thread = threading.Thread(target=recorder._record_audio)
-        recorder.record_thread.start()
-        try:
-            time.sleep(0.5)
-        finally:
-            recorder.is_recording = False
-            recorder.record_thread.join(timeout=2.0)
-
-        assert mock_stream.read.call_count > 1
-        assert recorder.audio_queue.empty()
-
-    def test_dead_capture_thread_reads_as_not_recording(self, recorder, mock_sd):
-        """A device error must not leave callers waiting on 'Listening...'."""
-        mock_stream = mock_sd.InputStream.return_value
-        mock_stream.read.side_effect = OSError("device unplugged")
-
-        recorder.start_recording()
-        try:
-            recorder.record_thread.join(timeout=2.0)
-            assert not recorder.is_recording
-            assert recorder.capture_failed
-        finally:
-            recorder.stop_recording()  # also ends the non-daemon process thread
-        assert not recorder.capture_failed

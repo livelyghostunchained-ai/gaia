@@ -1,15 +1,8 @@
 ---
 title: "Audio & Voice"
 description: "Voice interaction with ASR, TTS, and voice chat orchestration"
-icon: "headphones"
+icon: "microphone"
 ---
-
-<Warning>
-The direct OpenAI and LiteLLM provider adapters have been removed. Any
-`use_chatgpt` field shown below is a migration-error shim: setting it to `True`
-raises before inference. Use the [Lemonade gateway path](/sdk/sdks/llm#gateway-migration).
-</Warning>
-
 
 <Info>
   **Source Code:** [`src/gaia/audio/`](https://github.com/amd/gaia/blob/main/src/gaia/audio/)
@@ -18,19 +11,14 @@ raises before inference. Use the [Lemonade gateway path](/sdk/sdks/llm#gateway-m
 <Note>
 **Components:** AudioClient, WhisperAsr, KokoroTTS
 **Module:** `gaia.audio`
-**Import:**
-```python
-from gaia.audio.audio_client import AudioClient
-from gaia.audio.whisper_asr import WhisperAsr
-from gaia.audio.kokoro_tts import KokoroTTS
-```
+**Import:** `from gaia.audio import AudioClient, WhisperAsr, KokoroTTS`
 </Note>
 
 ---
 
 ## Overview
 
-The audio subsystem provides complete voice interaction capabilities including Automatic Speech Recognition (ASR), Text-to-Speech (TTS), and voice chat orchestration. AudioClient coordinates ASR and TTS with LLM generation, while WhisperAsr handles voice-to-text transcription and KokoroTTS provides high-quality speech synthesis. Both models are served by Lemonade Server (`/api/v1/audio/transcriptions` and `/api/v1/audio/speech`); GAIA runs no speech model in-process.
+The audio subsystem provides complete voice interaction capabilities including Automatic Speech Recognition (ASR), Text-to-Speech (TTS), and voice chat orchestration. AudioClient coordinates ASR and TTS with LLM generation, while WhisperAsr handles voice-to-text transcription and KokoroTTS provides high-quality speech synthesis.
 
 **Key Features:**
 - Voice chat with streaming TTS
@@ -38,7 +26,7 @@ The audio subsystem provides complete voice interaction capabilities including A
 - High-quality Kokoro TTS with multiple voices (17+ available)
 - Streaming audio processing with real-time playback
 - Interrupt handling (keyboard and voice)
-- Models pulled through Lemonade on first use; Lemonade picks the device
+- GPU acceleration support
 - Thread-safe operation
 
 ---
@@ -53,14 +41,14 @@ The audio subsystem provides complete voice interaction capabilities including A
 - Queue-based transcription delivery
 
 ### WhisperAsr
-- Real-time speech recognition: each utterance is transcribed by Lemonade's Whisper
-- Configurable model sizes (tiny, base, small, medium, large, turbo)
+- Real-time speech recognition using Whisper
+- Configurable model sizes (tiny, base, small, medium, large)
 - Voice Activity Detection with silence thresholds
 - Pause/resume recording capability
-- A Lemonade failure stops recording and is reported on `asr_error`
+- GPU acceleration (CUDA support)
 
 ### KokoroTTS
-- High-quality speech synthesis via Lemonade's `kokoro-v1` model
+- High-quality speech synthesis
 - Multiple voice options (American/British, male/female)
 - Streaming audio generation
 - Real-time playback
@@ -73,7 +61,7 @@ The audio subsystem provides complete voice interaction capabilities including A
 ### AudioClient
 
 ```python
-from gaia.audio.audio_client import AudioClient
+from gaia.audio import AudioClient
 
 class AudioClient:
     """Handles all audio-related functionality including TTS, ASR, and voice chat."""
@@ -83,33 +71,24 @@ class AudioClient:
         whisper_model_size="base",
         audio_device_index=None,
         silence_threshold=0.5,
-        mic_threshold=0.003,
         enable_tts=True,
         logging_level="INFO",
         use_claude=False,
         use_chatgpt=False,
         system_prompt=None,
-        model=None,
-        claude_model="claude-sonnet-5",
-        base_url=None,
     ):
         """
         Initialize audio client.
 
         Args:
-            whisper_model_size: Whisper model size (tiny, base, small, medium, large, turbo)
+            whisper_model_size: Whisper model size (tiny, base, small, medium, large)
             audio_device_index: Audio input device index (None = default)
             silence_threshold: Silence duration before processing (seconds)
-            mic_threshold: Microphone amplitude threshold for voice-activity
-                detection (passed through to WhisperAsr as silence_threshold).
             enable_tts: Enable text-to-speech output
             logging_level: Logging level (DEBUG, INFO, WARNING, ERROR)
             use_claude: Use Claude API for LLM
-            use_chatgpt: Removed; True raises migration guidance
+            use_chatgpt: Use ChatGPT API for LLM
             system_prompt: Default system prompt for LLM
-            model: Model ID for the local/OpenAI provider (None = provider default)
-            claude_model: Claude model ID, used when use_claude=True
-            base_url: Lemonade server URL (None = LEMONADE_BASE_URL or default)
         """
         pass
 
@@ -131,9 +110,6 @@ class AudioClient:
         """
         Process transcribed voice input and get AI response.
 
-        Capture stays paused until streamed playback has fully finished;
-        transcriptions queued meanwhile are discarded before capture resumes.
-
         Args:
             text: Transcribed text to process
             get_stats_callback: Optional callback for performance stats
@@ -141,15 +117,7 @@ class AudioClient:
         pass
 
     async def speak_text(self, text: str):
-        """Speak text using TTS.
-
-        Returns once playback has finished. The microphone is paused for the
-        whole utterance and anything transcribed meanwhile is discarded, so
-        the assistant never hears its own reply as the next user turn.
-        Playback cleanup is bounded by synthesized audio duration plus five
-        seconds. On a device timeout, the call raises and capture stays paused;
-        restart voice chat after checking the output device.
-        """
+        """Speak text using TTS."""
         pass
 
     async def halt_generation(self):
@@ -160,46 +128,31 @@ class AudioClient:
 ### WhisperAsr
 
 ```python
-from gaia.audio.whisper_asr import WhisperAsr
+from gaia.audio import WhisperAsr
 
 class WhisperAsr:
-    """Live-microphone speech-to-text, transcribed by Lemonade's Whisper."""
+    """Whisper-based Automatic Speech Recognition."""
 
     def __init__(
         self,
-        model_size="base",
+        model_size="small",
         device_index=None,
         transcription_queue=None,
+        enable_cuda=False,
         silence_threshold=None,
         min_audio_length=None,
-        base_url=None,
-        language="en",
-        client=None,
-        say=None,
     ):
         """
-        Initialize Whisper ASR and pull its Lemonade model if needed.
+        Initialize Whisper ASR.
 
         Args:
-            model_size: tiny, base, small, medium, large or turbo — mapped to
-                Whisper-Tiny … Whisper-Large-v3-Turbo on Lemonade
+            model_size: Whisper model size (tiny, base, small, medium, large)
             device_index: Audio input device index (None = default)
             transcription_queue: Queue to receive transcriptions
-            silence_threshold: Custom voice-activity energy threshold
-            min_audio_length: Minimum utterance length in samples
-            base_url: Lemonade API root (default: LEMONADE_BASE_URL)
-            language: ISO 639-1 code sent with every utterance
-            client: A ready LemonadeASRClient (tests inject one)
-            say: Called with a line before a model download
-
-        Raises:
-            ConnectionError: Lemonade Server is not reachable
-            LemonadeASRError: Lemonade cannot serve the Whisper model
+            enable_cuda: Enable GPU acceleration
+            silence_threshold: Custom silence threshold (default: 0.01)
+            min_audio_length: Minimum audio length in samples (default: 16000)
         """
-        pass
-
-    def transcribe_utterance(self, audio) -> str:
-        """Send one 16 kHz float utterance to Lemonade; return its text."""
         pass
 
     def start_recording(self):
@@ -226,24 +179,20 @@ class WhisperAsr:
 ### KokoroTTS
 
 ```python
-from gaia.audio.kokoro_tts import KokoroTTS
+from gaia.audio import KokoroTTS
 
 class KokoroTTS:
     """Kokoro-based Text-to-Speech synthesis."""
 
-    def __init__(self, base_url=None, client=None, say=None):
+    def __init__(self):
         """
-        Initialize Kokoro TTS and pull Lemonade's kokoro-v1 model if needed.
+        Initialize Kokoro TTS.
 
         Note:
+            - Uses American English by default
             - Default voice: af_bella (A- quality)
             - 17+ voices available
-            - Playback needs sounddevice ([talk] extra); synthesis does not
         """
-        pass
-
-    def generate_speech(self, text, stream_callback=None) -> tuple:
-        """Return (24 kHz float32 samples, stats), synthesized sentence by sentence."""
         pass
 
     def generate_speech_streaming(
@@ -266,7 +215,7 @@ class KokoroTTS:
         """
         pass
 
-    def list_available_voices(self) -> dict:
+    def get_available_voices(self) -> dict:
         """
         Get available voice configurations.
 
@@ -295,13 +244,14 @@ class KokoroTTS:
 # pyproject.toml
 [project.optional-dependencies]
 talk = [
-    "sounddevice",   # Microphone capture & speaker playback
-    "websockets",    # Staged for Lemonade Realtime transcription (#372)
+    "openai-whisper>=20231117",  # ASR
+    "torch>=2.0.0",              # Whisper backend
+    "kokoro>=0.3.1",             # TTS
+    "sounddevice>=0.4.6",        # Audio recording & playback
+    "soundfile>=0.12.1",         # Audio file I/O
+    "psutil",                    # Process management
 ]
 ```
-
-Speech recognition and synthesis need a running Lemonade Server with a Whisper
-model and `kokoro-v1`; both are pulled on first use.
 
 ---
 
@@ -311,7 +261,7 @@ model and `kokoro-v1`; both are pulled on first use.
 
 ```python
 import asyncio
-from gaia.audio.audio_client import AudioClient
+from gaia.audio import AudioClient
 
 async def main():
     audio = AudioClient(
@@ -331,7 +281,7 @@ asyncio.run(main())
 ### Custom Voice Settings
 
 ```python
-from gaia.audio.audio_client import AudioClient
+from gaia.audio import AudioClient
 
 audio = AudioClient(enable_tts=True)
 audio.initialize_tts()
@@ -347,15 +297,16 @@ await audio.speak_text("Hello in a different voice")
 
 ```python
 import queue
-from gaia.audio.whisper_asr import WhisperAsr
+from gaia.audio import WhisperAsr
 
 # Create transcription queue
 transcription_queue = queue.Queue()
 
 # Initialize ASR
 asr = WhisperAsr(
-    model_size="small",  # Whisper-Small on Lemonade
+    model_size="small",
     transcription_queue=transcription_queue,
+    enable_cuda=True  # Use GPU
 )
 
 # Start recording
@@ -375,7 +326,7 @@ except KeyboardInterrupt:
 ```python
 import queue
 import threading
-from gaia.audio.kokoro_tts import KokoroTTS
+from gaia.audio import KokoroTTS
 
 tts = KokoroTTS()
 text_queue = queue.Queue()
@@ -401,7 +352,7 @@ thread.join()
 
 **License**
 
-Copyright(C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
+Copyright(C) 2024-2025 Advanced Micro Devices, Inc. All rights reserved.
 
 SPDX-License-Identifier: MIT
 
